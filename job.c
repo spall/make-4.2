@@ -27,6 +27,9 @@ this program.  If not, see <http://www.gnu.org/licenses/>.  */
 
 #include <string.h>
 
+#include <time.h>
+#include <sys/times.h>
+
 /* Default shell to use.  */
 #ifdef WINDOWS32
 #include <windows.h>
@@ -74,6 +77,86 @@ char * vms_strsignal (int status);
 #endif
 
 #else
+
+int timespec_subtract(struct timespec *result, struct timespec *x, struct timespec *y)
+{
+
+  time_t sec_add;
+  unsigned long long nsec_add;
+  if (x->tv_nsec < y->tv_nsec) {
+    sec_add = x->tv_sec - 1; /* steal 1 second */
+    nsec_add = 1000000000 + x->tv_nsec;
+
+    result->tv_nsec = nsec_add - y->tv_nsec;
+    result->tv_sec = sec_add - y->tv_sec;
+  } else {
+    result->tv_nsec = x->tv_nsec - y->tv_nsec;
+    result->tv_sec = x->tv_sec - y->tv_sec;
+  }
+
+  if (x->tv_sec == y->tv_sec) {
+    return x->tv_nsec < y->tv_nsec;
+  }
+
+  return x->tv_sec < y->tv_sec;
+}
+
+int estimate_timing_overhead(struct timespec *overhead) {
+  struct timespec *ov1 = malloc(sizeof(struct timespec));
+  struct timespec *ov2 = malloc(sizeof(struct timespec));
+  int r1, r2;
+  
+  if (ov1 == NULL || ov2 == NULL) {
+    perror("malloc");
+    exit(EXIT_FAILURE);
+  }
+
+  r1 = clock_gettime(CLOCK_REALTIME, ov1);
+  r2 = clock_gettime(CLOCK_REALTIME, ov2);
+
+  if (-1 == r1 || -1 == r2) {
+    exit(EXIT_FAILURE);
+  }
+
+  if (1 == timespec_subtract(overhead, ov2, ov1)) { // ov2 - ov1                                     
+    fprintf(stderr, "Negative overhead\n");
+    exit(EXIT_FAILURE);
+  }
+
+  free(ov1);
+  free(ov2);
+  return EXIT_SUCCESS;
+}
+
+// result = x - y - z                                                                                
+int timespec_subtract_3(struct timespec *result, struct timespec *x, struct timespec *y, struct timespec *z) {
+
+  struct timespec *tmp = malloc(sizeof(struct timespec));
+
+  if(tmp == NULL) {
+    perror("malloc");
+    exit(EXIT_FAILURE);
+  }
+
+  if (1 == timespec_subtract(tmp, x, y)) {
+    fprintf(stderr, "Negative time: %lld.%ld - %lld.%ld\n", (long long)x->tv_sec, x->tv_nsec, (long long)y->tv_sec, y->tv_nsec);
+    exit(EXIT_FAILURE);
+  }
+
+  if (1 == timespec_subtract(result, tmp, z)) {
+    fprintf(stderr, "Negative time: %lld.%ld - %lld.%ld\n", (long long)tmp->tv_sec, tmp->tv_nsec, (long long)z->tv_sec, z->tv_nsec);
+    exit(EXIT_FAILURE);
+  }
+
+  free(tmp);
+
+  return EXIT_SUCCESS;
+}
+
+static struct timespec *starttime;
+static struct timespec *endtime;
+static const char* output_fn;
+static int curscnum;
 
 const char *default_shell = "/bin/sh";
 int batch_mode_shell = 0;
@@ -588,6 +671,12 @@ reap_children (int block, int err)
       int any_remote, any_local;
       int dontcare;
 
+      struct tms *cpu_time;
+      struct timespec *tt, *overhead;
+      double user_time;
+      double sys_time;
+      FILE *out;
+
       if (err && block)
         {
           static int printed = 0;
@@ -679,6 +768,38 @@ reap_children (int block, int err)
           else
             pid = 0;
 
+	  /* begin my code */
+	  if (clock_gettime(CLOCK_REALTIME, endtime) == -1) {
+	    perror_with_name ("clock_gettime", "");
+	    exit(EXIT_FAILURE);
+	  }
+
+	  cpu_time = xmalloc(sizeof(struct tms));
+
+	  if (times(cpu_time) == -1) {
+	    perror_with_name ("times", "");
+	    exit(EXIT_FAILURE);
+	  }
+          
+	  user_time = ((double) cpu_time->tms_cutime) / CLOCKS_PER_SEC;
+	  sys_time = ((double) cpu_time->tms_cstime) / CLOCKS_PER_SEC;
+          
+	  tt = xmalloc(sizeof(struct timespec));
+	  overhead = xmalloc(sizeof(struct timespec));
+          
+	  estimate_timing_overhead(overhead);
+	  timespec_subtract_3(tt, endtime, starttime, overhead);
+          
+	  out = fopen(output_fn, "a");
+	  fprintf(out, "argv=");
+	  fprintf(out, " todo\n");
+          
+	  fprintf(out, "elapsed= %lld.%.9ld ; user= %f ; sys= %f\n", (long long) tt->tv_sec, tt->tv_nsec, user_time, sys_time);
+	  fprintf(out, "finished shell-command: %d\n", curscnum);
+	  fflush(out);
+	  fclose(out);
+          /* end my code */
+	  
           if (pid < 0)
             {
               /* The wait*() failed miserably.  Punt.  */
@@ -1365,6 +1486,14 @@ start_job_command (struct child *child)
 
       char **parent_environ;
 
+      const char* scnum_fn;
+      FILE *scnum_file;
+      FILE *out;
+      char *line;
+      size_t len;
+      char ** tmp_env;
+      int i;
+
     run_local:
       block_sigs ();
 
@@ -1384,7 +1513,68 @@ start_job_command (struct child *child)
 
       jobserver_pre_child (flags & COMMANDS_RECURSE);
 
-      child->pid = child_execute_job (&child->output, child->good_stdin, argv, child->environment);
+      /* begin my code */
+      scnum_fn = getenv("SCNUM");
+      output_fn = getenv("OUTPUTFILE");
+      
+      if (scnum_fn == NULL && output_fn == NULL) {
+	perror("getenv");
+	exit(EXIT_FAILURE);
+      }
+      scnum_file = fopen(scnum_fn, "r");
+      if (scnum_file == NULL) {
+	perror("fopen");
+	exit(EXIT_FAILURE);
+      }
+      
+      line = NULL;
+      len = 0;
+      if (getline(&line, &len, scnum_file) == -1) {
+	perror("getline");
+	exit(EXIT_FAILURE);
+      }
+      fclose(scnum_file);
+      
+      scnum_file = fopen(scnum_fn, "w");
+      curscnum = atoi(line);
+
+      fprintf(scnum_file, "%d\n", curscnum + 1);
+      fflush(scnum_file);
+      fclose(scnum_file);
+
+      i = 0;
+      while (child->environment[i] != 0) {
+	i = i + 1;
+      }
+      
+      tmp_env = xmalloc((i + 2) * (sizeof (char *)));
+      
+      i = 0;
+      for (i = 0; child->environment[i] != 0; ++i) {
+	tmp_env[i] = child->environment[i];
+      }
+
+      // CURSCNUM
+      char *tmp_var = xmalloc(sizeof(char)*(1 + 9 + strlen(line)));
+      sprintf(tmp_var, "CURSCNUM=%s", line);
+      tmp_env[i] = tmp_var;
+      tmp_env[i+1] = 0;
+      
+      out = fopen(output_fn, "a");
+      fprintf(out, "executing shell-command: %d\n", curscnum);
+      fflush(out);
+      fclose(out);
+      
+      starttime = xmalloc(sizeof(struct timespec));
+      endtime = xmalloc(sizeof(struct timespec));
+      
+      if (-1 == clock_gettime(CLOCK_REALTIME, starttime)) {
+	perror_with_name ("clock_gettime", "");
+	goto error;
+      }
+      /* end my code */
+
+      child->pid = child_execute_job (&child->output, child->good_stdin, argv, tmp_env);
 
       environ = parent_environ; /* Restore value child may have clobbered.  */
       jobserver_post_child (flags & COMMANDS_RECURSE);
