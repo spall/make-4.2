@@ -1066,6 +1066,13 @@ int
 main (int argc, char **argv, char **envp)
 #endif
 {
+  // get time at start of running make.
+  // might need to move this to unix ifdef area
+  struct timespec *makestart = xmalloc(sizeof(struct timespec));
+  if (-1 != clock_gettime(CLOCK_REALTIME, makestart)) {
+    fprintf(stderr, "Start of make overhead: %lld.%.9ld\n", (long long) makestart->tv_sec, makestart->tv_nsec);
+  }
+
   static char *stdin_nm = 0;
   int makefile_status = MAKE_SUCCESS;
   struct goaldep *read_files;
@@ -2552,6 +2559,12 @@ main (int argc, char **argv, char **envp)
   /* Update the goals.  */
 
   DB (DB_BASIC, (_("Updating goal targets....\n")));
+
+  // somewhere here we stopped doing overhead?
+  struct timespec *makeend = xmalloc(sizeof(struct timespec));
+  if (-1 != clock_gettime(CLOCK_REALTIME, makeend)) {
+    fprintf(stderr, "End of make overhead: %lld.%.9ld\n", (long long) makeend->tv_sec, makeend->tv_nsec);
+  }
 
   {
     switch (update_goal_chain (goals))
